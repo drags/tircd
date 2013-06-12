@@ -8,7 +8,7 @@
 
 use strict;
 use JSON::Any;
-use Net::Twitter::Lite;
+use Net::Twitter::Lite::WithAPIv1_1 0.12000;
 use Time::Local;
 use File::Glob ':glob';
 use IO::File;
@@ -235,7 +235,7 @@ sub twitter_api_error {
   if ($error) {
     $kernel->post('logger','log',$msg.' ('.$error->code() .' from Twitter API).',$heap->{'username'});  
 
-    if ($error->code() == 400) {
+    if ($error->code() == 429) {
       $msg .= ' Twitter API limit reached.';
     } else {
       $msg .= ' Twitter Fail Whale.';
@@ -332,7 +332,7 @@ sub twitter_oauth_login_begin {
 
 	$kernel->yield('server_reply',463,'OAuth authentication beginning.');
 
-	$heap->{'twitter'} = Net::Twitter::Lite->new(%{$heap->{'nt_params'}});
+	$heap->{'twitter'} = Net::Twitter::Lite::WithAPIv1_1->new(%{$heap->{'nt_params'}});
 
 	# load user config from disk for reusing tokens
 	if (-d $config{'storage_path'}) {
@@ -516,7 +516,7 @@ sub tircd_verify_ssl {
 	}
 
 	# check ssl cert using LWP
-	my $api_check = Net::Twitter::Lite->new;
+	my $api_check = Net::Twitter::Lite::WithAPIv1_1->new;
 	my $sslcheck = LWP::UserAgent->new;
 	my $apiurl = URI->new($api_check->{'apiurl'});
 	# second level domain, aka domain.tld. if this is present in the certificate, we are happy
@@ -879,7 +879,7 @@ sub irc_whois {
   my $error;
   
   if (!$friend) {#if we don't have their info already try to get it from twitter, and track it for the end of this function
-    $friend = eval { $heap->{'twitter'}->show_user($target) };
+    $friend = eval { $heap->{'twitter'}->show_user({screen_name => $target}) };
     $error = $@;
     $isfriend = 0;
   }
@@ -1392,13 +1392,13 @@ sub irc_kick {
     return;
   }
   
-  my $result = eval { $heap->{'twitter'}->destroy_friend($kickee) };
+  my $result = eval { $heap->{'twitter'}->destroy_friend({screen_name => $kickee}) };
   my $error = $@;
   if ($result) {
     $kernel->call($_[SESSION],'remfriend',$kickee);
     delete $heap->{'channels'}->{$chan}->{'names'}->{$kickee};
     $kernel->yield('user_msg','KICK',$heap->{'username'},$chan,$kickee,$kickee);
-    $kernel->post('logger','log',"Stoped following $kickee",$heap->{'username'});
+    $kernel->post('logger','log',"Stopped following $kickee",$heap->{'username'});
   } else {
     if (ref $error && $error->isa("Net::Twitter::Lite::Error") && $error->code() >= 400) {
       $kernel->call($_[SESSION],'twitter_api_error','Unable to unfollow user.',$error);    
@@ -1688,7 +1688,7 @@ sub twitter_timeline {
       # Also, only adding them to 'friends' if they really are friends
 
       $kernel->post('logger','log','Getting userinfo for ' . $item->{'user'}->{'screen_name'},$heap->{'username'}) if $config{'debug'} >=2;
-      $is_following = eval { $heap->{'twitter'}->show_user($item->{'user'}->{'screen_name'}) };
+      $is_following = eval { $heap->{'twitter'}->show_user({screen_name => $item->{'user'}->{'screen_name'}}) };
       $kernel->post('logger','log','Got name: ' . $is_following->{'name'} . ' following: ' . $is_following->{'following'}, $heap->{'username'}) if $config{'debug'} >=2;
       if ($is_following->{'following'} == 1) {
 	# We are following this user, add to 'friends'
@@ -1828,7 +1828,7 @@ sub twitter_search {
   my ($kernel, $heap, $chan) = @_[KERNEL, HEAP, ARG0];
 
   if (!$heap->{'channels'}->{$chan}->{'joined'} || !$heap->{'channels'}->{$chan}->{'topic'}) {
-    #if we aren't in the channel, don't od anythning, this will keep us from restarting timers for channels we are no longer in
+    #if we aren't in the channel, don't do anything, this will keep us from restarting timers for channels we are no longer in
     return;
   }
   
@@ -1844,7 +1844,7 @@ sub twitter_search {
 
   my $delay = 30;
 
-  if (!$data || $data->{'max_id'} < $heap->{'channels'}->{$chan}->{'search_since_id'} ) {
+  if (!$data || $data->{'search_metadata'}->{'max_id'} < $heap->{'channels'}->{$chan}->{'search_since_id'} ) {
     $data = {results => []};
     $kernel->call($_[SESSION],'twitter_api_error','Unable to update search results.',$error);   
     if ($error) {
@@ -1856,19 +1856,19 @@ sub twitter_search {
     }
 
   } else {
-    $heap->{'channels'}->{$chan}->{'search_since_id'} = $data->{'max_id'};
-    if (@{$data->{'results'}} > 0) {
-      $kernel->post('logger','log','Received '.@{$data->{'results'}}.' search results from Twitter.',$heap->{'username'});
+    $heap->{'channels'}->{$chan}->{'search_since_id'} = $data->{'search_metadata'}->{'max_id'};
+    if (@{$data->{'statuses'}} > 0) {
+      $kernel->post('logger','log','Received '.@{$data->{'statuses'}}.' search results from Twitter.',$heap->{'username'});
     }      
   }
 
-  foreach my $result (sort {$a->{'id'} <=> $b->{'id'}} @{$data->{'results'}}) {
+  foreach my $result (sort {$a->{'id'} <=> $b->{'id'}} @{$data->{'statuses'}}) {
     ### Search API does not support entities yet. 
     #   When that happens we should either copy the code from timeline to expand urls and realname
     #   Or we should split that out as a function 
     #   /Olatho
-    if ($result->{'from_user'} ne $heap->{'username'}) {
-      $kernel->yield('user_msg','PRIVMSG',$result->{'from_user'},$chan,$result->{'text'});
+    if ($result->{'user'}->{'screen_name'} ne $heap->{'username'}) {
+      $kernel->yield('user_msg','PRIVMSG',$result->{'user'}->{'screen_name'},$chan,$result->{'text'});
     }
   }
 
@@ -1933,6 +1933,9 @@ sub twitter_conversation {
 
 sub twitter_conversation_related {
   my($kernel, $heap, $tweet_id) = @_[KERNEL, HEAP, ARG0];
+  $kernel->post('logger','log','related api no longer supported');
+  return;
+
   $kernel->post('logger','log','Getting related from status: '. $tweet_id);
   my $related = eval { $heap->{'twitter'}->related_results($tweet_id) };
   my $error = $@;
